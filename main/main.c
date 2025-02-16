@@ -85,8 +85,93 @@ static void handle_running_status(uint8_t status) {
     }
 }
 
+// Add these constants for sound generation
+#define PI 3.14159265358979323846
+#define SAMPLE_RATE 44100
+#define VOLUME 0.5
 
-// Add this process_midi_message function before midi_chr_access
+// Add these sound generation functions
+static void generate_kick(int16_t* buffer, size_t samples) {
+    float frequency = 150.0;  // Starting frequency
+    float decay = 0.002;      // Frequency decay rate
+    float amplitude = 32000 * VOLUME;  // Starting amplitude
+    float amp_decay = 0.998;  // Amplitude decay factor
+
+    for (size_t i = 0; i < samples; i++) {
+        float t = (float)i / SAMPLE_RATE;
+        float current_freq = frequency * exp(-decay * i);
+        float sample = amplitude * sin(2.0 * PI * current_freq * t);
+        
+        amplitude *= amp_decay;
+        
+        // Convert to 16-bit and apply to both channels
+        int16_t sample_int = (int16_t)sample;
+        buffer[i * 2] = sample_int;     // Left channel
+        buffer[i * 2 + 1] = sample_int; // Right channel
+    }
+}
+
+static void generate_snare(int16_t* buffer, size_t samples) {
+    float frequency = 400.0;   // Main frequency component
+    float noise_mix = 0.5;     // Mix between tone and noise
+    float amplitude = 32000 * VOLUME;
+    float amp_decay = 0.997;   // Faster decay than kick
+
+    for (size_t i = 0; i < samples; i++) {
+        float t = (float)i / SAMPLE_RATE;
+        float tone = sin(2.0 * PI * frequency * t);
+        float noise = ((float)rand() / RAND_MAX) * 2.0 - 1.0;
+        float sample = amplitude * (tone * (1.0 - noise_mix) + noise * noise_mix);
+        
+        amplitude *= amp_decay;
+        
+        int16_t sample_int = (int16_t)sample;
+        buffer[i * 2] = sample_int;
+        buffer[i * 2 + 1] = sample_int;
+    }
+}
+
+static void generate_hihat(int16_t* buffer, size_t samples) {
+    float amplitude = 24000 * VOLUME;  // Slightly lower volume
+    float amp_decay = 0.995;          // Fast decay
+
+    for (size_t i = 0; i < samples; i++) {
+        // Generate filtered noise
+        float noise = 0;
+        for (int j = 0; j < 4; j++) {  // Simple filtering
+            noise += ((float)rand() / RAND_MAX) * 2.0 - 1.0;
+        }
+        noise /= 4.0;
+        
+        float sample = amplitude * noise;
+        amplitude *= amp_decay;
+        
+        int16_t sample_int = (int16_t)sample;
+        buffer[i * 2] = sample_int;
+        buffer[i * 2 + 1] = sample_int;
+    }
+}
+
+static void play_sound(int16_t* buffer, size_t samples) {
+    size_t bytes_written;
+    size_t bytes_to_write = samples * 4;  // 4 bytes per sample (2 channels * 2 bytes per sample)
+    
+    ESP_LOGI(TAG, "Attempting to play sound: %d bytes", bytes_to_write);
+    
+    // Log first few samples for debugging
+    for (int i = 0; i < 4 && i < samples; i++) {
+        ESP_LOGI(TAG, "Sample %d: L=%d, R=%d", i, buffer[i*2], buffer[i*2+1]);
+    }
+    
+    esp_err_t ret = i2s_write(I2S_NUM, buffer, bytes_to_write, &bytes_written, portMAX_DELAY);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to write to I2S: %d", ret);
+    } else {
+        ESP_LOGI(TAG, "Successfully wrote %d bytes to I2S", bytes_written);
+    }
+}
+
+// Update the process_midi_message function to include sound generation
 static void process_midi_message(uint8_t status, uint8_t* data, size_t len, uint32_t timestamp) {
     // Log received message
     ESP_LOGI(TAG, "MIDI message received - Status: 0x%02X, Len: %d, Timestamp: %lu", 
@@ -102,22 +187,22 @@ static void process_midi_message(uint8_t status, uint8_t* data, size_t len, uint
         if (velocity > 0) {
             switch(note) {
                 case MIDI_NOTE_KICK:
-                    //generate_kick(audio_buffer, SAMPLES_PER_BUFFER);
-                    //play_sound(audio_buffer, SAMPLES_PER_BUFFER);
+                    generate_kick(audio_buffer, SAMPLES_PER_BUFFER);
+                    play_sound(audio_buffer, SAMPLES_PER_BUFFER);
                     snprintf(latest_midi_msg, sizeof(latest_midi_msg), 
                         "Kick Drum - Note: %d, Velocity: %d", note, velocity);
                     break;
                     
                 case MIDI_NOTE_SNARE:
-                    //(audio_buffer, SAMPLES_PER_BUFFER);
-                    //play_sound(audio_buffer, SAMPLES_PER_BUFFER);
+                    generate_snare(audio_buffer, SAMPLES_PER_BUFFER);
+                    play_sound(audio_buffer, SAMPLES_PER_BUFFER);
                     snprintf(latest_midi_msg, sizeof(latest_midi_msg), 
                         "Snare Drum - Note: %d, Velocity: %d", note, velocity);
                     break;
                     
                 case MIDI_NOTE_HIHAT:
-                    //generate_hihat(audio_buffer, SAMPLES_PER_BUFFER);
-                    //play_sound(audio_buffer, SAMPLES_PER_BUFFER);
+                    generate_hihat(audio_buffer, SAMPLES_PER_BUFFER);
+                    play_sound(audio_buffer, SAMPLES_PER_BUFFER);
                     snprintf(latest_midi_msg, sizeof(latest_midi_msg), 
                         "Hi-Hat - Note: %d, Velocity: %d", note, velocity);
                     break;
@@ -709,6 +794,7 @@ void app_main(void) {
 
     // Initialize I2S
     init_i2s();
+    ESP_LOGI(TAG, "I2S initialized");
 
     // Initialize WiFi
     init_wifi();
