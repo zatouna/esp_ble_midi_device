@@ -5,9 +5,18 @@
 #include "services/gap/ble_svc_gap.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_http_server.h"
+#include <string.h>
 
 #define DEVICE_NAME "ESP32 MIDI"
 #define TAG "BLE_MIDI"
+
+// Add these global variable declarations
+static char latest_midi_msg[128] = "";
+static bool new_message = false;
+static httpd_handle_t server = NULL;
 
 // Define MIDI service and characteristic UUIDs
 static const ble_uuid128_t midi_service_uuid = BLE_UUID128_INIT(
@@ -85,11 +94,6 @@ static int midi_chr_access(uint16_t conn_handle, uint16_t attr_handle,
             if (ctxt->om->om_len > 0) {
                 uint8_t *midi_data = OS_MBUF_DATA(ctxt->om, uint8_t *);
                 
-                ESP_LOGI(TAG, "Received MIDI data of length: %d", ctxt->om->om_len);
-                for(int i = 0; i < ctxt->om->om_len; i++) {
-                    ESP_LOGI(TAG, "Byte %d: 0x%02x", i, midi_data[i]);
-                }
-
                 if (ctxt->om->om_len >= 5) {
                     uint8_t status = midi_data[2];
                     uint8_t data1 = midi_data[3];
@@ -97,18 +101,23 @@ static int midi_chr_access(uint16_t conn_handle, uint16_t attr_handle,
 
                     switch(status & 0xF0) {
                         case 0x90:
-                            ESP_LOGI(TAG, "Note On - Note: %d, Velocity: %d", data1, data2);
+                            snprintf(latest_midi_msg, sizeof(latest_midi_msg), 
+                                "Note On - Note: %d, Velocity: %d", data1, data2);
                             break;
                         case 0x80:
-                            ESP_LOGI(TAG, "Note Off - Note: %d, Velocity: %d", data1, data2);
+                            snprintf(latest_midi_msg, sizeof(latest_midi_msg), 
+                                "Note Off - Note: %d, Velocity: %d", data1, data2);
                             break;
                         case 0xB0:
-                            ESP_LOGI(TAG, "Control Change - Controller: %d, Value: %d", data1, data2);
+                            snprintf(latest_midi_msg, sizeof(latest_midi_msg), 
+                                "Control Change - Controller: %d, Value: %d", data1, data2);
                             break;
                         default:
-                            ESP_LOGI(TAG, "Other MIDI message - Status: 0x%02x", status);
+                            snprintf(latest_midi_msg, sizeof(latest_midi_msg), 
+                                "Other MIDI message - Status: 0x%02x", status);
                             break;
                     }
+                    new_message = true;
                 }
             }
             return 0;
@@ -128,7 +137,121 @@ static void host_task(void *param) {
     nimble_port_freertos_deinit();
 }
 
+// WiFi credentials
+#define WIFI_SSID "Sherif-Home-2.4_EXT"
+#define WIFI_PASS "20268575716115134561"
+
+// HTML page with WebSocket client
+static const char *html_page = "\
+<!DOCTYPE html>\
+<html>\
+<head>\
+    <title>ESP32 MIDI Logger</title>\
+    <style>\
+        body { font-family: Arial, sans-serif; margin: 20px; }\
+        #log { background: #f0f0f0; padding: 10px; height: 400px; overflow-y: scroll; }\
+    </style>\
+</head>\
+<body>\
+    <h1>ESP32 MIDI Logger</h1>\
+    <div id='log'></div>\
+    <script>\
+        var log = document.getElementById('log');\
+        function fetchLogs() {\
+            fetch('/logs')\
+                .then(response => response.text())\
+                .then(data => {\
+                    if (data) {\
+                        log.innerHTML += data + '<br>';\
+                        log.scrollTop = log.scrollHeight;\
+                    }\
+                });\
+            setTimeout(fetchLogs, 1000);\
+        }\
+        fetchLogs();\
+    </script>\
+</body>\
+</html>";
+
+// HTTP GET handler for main page
+static esp_err_t get_handler(httpd_req_t *req) {
+    httpd_resp_send(req, html_page, strlen(html_page));
+    return ESP_OK;
+}
+
+// HTTP GET handler for logs
+static esp_err_t logs_handler(httpd_req_t *req) {
+    if (new_message) {
+        httpd_resp_send(req, latest_midi_msg, strlen(latest_midi_msg));
+        new_message = false;
+    } else {
+        httpd_resp_send(req, "", 0);
+    }
+    return ESP_OK;
+}
+
+// Start web server
+static void start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    
+    if (httpd_start(&server, &config) == ESP_OK) {
+        // URI handler for root page
+        httpd_uri_t uri_get = {
+            .uri = "/",
+            .method = HTTP_GET,
+            .handler = get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &uri_get);
+
+        // URI handler for logs
+        httpd_uri_t uri_logs = {
+            .uri = "/logs",
+            .method = HTTP_GET,
+            .handler = logs_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &uri_logs);
+    }
+}
+
+// WiFi event handler
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                             int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        start_webserver();
+    }
+}
+
+// Initialize WiFi
+static void init_wifi(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
 void app_main(void) {
+    // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -136,6 +259,10 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    // Initialize WiFi
+    init_wifi();
+
+    // Initialize BLE
     ESP_ERROR_CHECK(nimble_port_init());
 
     int rc = ble_gatts_count_cfg(gatt_svr_svcs);
