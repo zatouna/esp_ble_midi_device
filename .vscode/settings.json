@@ -6,5 +6,9 @@
     ],
     "idf.port": "/dev/ttyACM1",
     "idf.toolsPath": "/home/pi/.espressif",
-    "idf.flashType": "JTAG"
+    "idf.flashType": "UART",
+    "files.associations": {
+        "ble_svc_gap.h": "c",
+        "nvs_flash.h": "c"
+    }
 }
