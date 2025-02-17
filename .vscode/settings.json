@@ -9,6 +9,7 @@
     "idf.flashType": "UART",
     "files.associations": {
         "ble_svc_gap.h": "c",
-        "nvs_flash.h": "c"
+        "nvs_flash.h": "c",
+        "string.h": "c"
     }
 }

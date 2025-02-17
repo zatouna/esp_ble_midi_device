@@ -10,6 +10,8 @@
 #include "esp_http_server.h"
 #include <string.h>
 #include "driver/i2s.h"
+#include "driver/i2s_std.h"
+#include "driver/gpio.h"
 #include "math.h"
 
 #define DEVICE_NAME "ESP32-retrial"
@@ -36,10 +38,9 @@ static const ble_uuid128_t midi_characteristic_uuid = BLE_UUID128_INIT(
 #define I2S_BCK_PIN (15)
 #define I2S_LRCK_PIN (16)
 #define I2S_DATA_PIN (17)
-
-#define SAMPLE_RATE     44100
-#define SAMPLE_BITS     16
-#define CHANNELS        2
+#define SAMPLE_RATE (44100)
+#define SAMPLE_BITS (16)
+#define CHANNELS (2)
 
 // MIDI note numbers
 #define MIDI_NOTE_KICK  36
@@ -87,16 +88,22 @@ static void handle_running_status(uint8_t status) {
 
 // Add these constants for sound generation
 #define PI 3.14159265358979323846
-#define SAMPLE_RATE 44100
 #define VOLUME 0.5
 
-// Add these sound generation functions
+static i2s_chan_handle_t tx_handle;
+
+// Add these function prototypes near the top with other function declarations
+static void generate_kick(int16_t* buffer, size_t samples);
+static void generate_snare(int16_t* buffer, size_t samples);
+static void generate_hihat(int16_t* buffer, size_t samples);
+
+// Add these drum sound generation functions before process_midi_message
 static void generate_kick(int16_t* buffer, size_t samples) {
     float frequency = 150.0;  // Starting frequency
     float decay = 0.002;      // Frequency decay rate
     float amplitude = 32000 * VOLUME;  // Starting amplitude
     float amp_decay = 0.998;  // Amplitude decay factor
-
+    
     for (size_t i = 0; i < samples; i++) {
         float t = (float)i / SAMPLE_RATE;
         float current_freq = frequency * exp(-decay * i);
@@ -106,8 +113,7 @@ static void generate_kick(int16_t* buffer, size_t samples) {
         
         // Convert to 16-bit and apply to both channels
         int16_t sample_int = (int16_t)sample;
-        buffer[i * 2] = sample_int;     // Left channel
-        buffer[i * 2 + 1] = sample_int; // Right channel
+        buffer[i] = sample_int;
     }
 }
 
@@ -126,8 +132,7 @@ static void generate_snare(int16_t* buffer, size_t samples) {
         amplitude *= amp_decay;
         
         int16_t sample_int = (int16_t)sample;
-        buffer[i * 2] = sample_int;
-        buffer[i * 2 + 1] = sample_int;
+        buffer[i] = sample_int;
     }
 }
 
@@ -147,23 +152,56 @@ static void generate_hihat(int16_t* buffer, size_t samples) {
         amplitude *= amp_decay;
         
         int16_t sample_int = (int16_t)sample;
-        buffer[i * 2] = sample_int;
-        buffer[i * 2 + 1] = sample_int;
+        buffer[i] = sample_int;
     }
 }
 
+// This is the only init_i2s function you should have in your code
+static void init_i2s(void) {
+    // Create I2S channel configuration
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle, NULL));
+
+    // Create I2S standard configuration
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = I2S_BCK_PIN,
+            .ws = I2S_LRCK_PIN,
+            .dout = I2S_DATA_PIN,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
+}
+
+// Update the play_sound function to use the new I2S API
 static void play_sound(int16_t* buffer, size_t samples) {
     size_t bytes_written;
     size_t bytes_to_write = samples * 4;  // 4 bytes per sample (2 channels * 2 bytes per sample)
     
     ESP_LOGI(TAG, "Attempting to play sound: %d bytes", bytes_to_write);
     
-    // Log first few samples for debugging
-    for (int i = 0; i < 4 && i < samples; i++) {
-        ESP_LOGI(TAG, "Sample %d: L=%d, R=%d", i, buffer[i*2], buffer[i*2+1]);
+    // Create stereo buffer
+    int32_t stereo_buffer[samples];
+    for (size_t i = 0; i < samples; i++) {
+        // Combine left and right channels into one 32-bit word
+        stereo_buffer[i] = (buffer[i] << 16) | (buffer[i] & 0xFFFF);
     }
     
-    esp_err_t ret = i2s_write(I2S_NUM, buffer, bytes_to_write, &bytes_written, portMAX_DELAY);
+    // Write to I2S
+    esp_err_t ret = i2s_channel_write(tx_handle, stereo_buffer, 
+                                     bytes_to_write, &bytes_written, 
+                                     portMAX_DELAY);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write to I2S: %d", ret);
     } else {
@@ -569,33 +607,6 @@ static size_t encode_midi_message(uint8_t *buffer, uint8_t status, uint8_t data1
     return 5;
 }
 
-// Function to initialize I2S
-static void init_i2s(void) {
-    i2s_config_t i2s_config = {
-        .mode = I2S_MODE_MASTER | I2S_MODE_TX,
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = SAMPLE_BITS,
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .dma_buf_count = 8,
-        .dma_buf_len = 256,
-        .use_apll = false,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1
-    };
-
-    i2s_pin_config_t pin_config = {
-        .bck_io_num = I2S_BCK_PIN,
-        .ws_io_num = I2S_LRCK_PIN,
-        .data_out_num = I2S_DATA_PIN,
-        .data_in_num = I2S_PIN_NO_CHANGE
-    };
-
-    ESP_ERROR_CHECK(i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL));
-    ESP_ERROR_CHECK(i2s_set_pin(I2S_NUM, &pin_config));
-}
-
-
-
 
 static void ble_app_on_sync(void) {
     ble_hs_cfg.sync_cb = NULL;
@@ -792,7 +803,7 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // Initialize I2S
+    // Initialize I2S first
     init_i2s();
     ESP_LOGI(TAG, "I2S initialized");
 
