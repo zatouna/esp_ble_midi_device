@@ -13,6 +13,8 @@
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
 #include "math.h"
+#include "wav_player.h"
+#include "sample_config.h"
 
 #define DEVICE_NAME "ESP32-retrial"
 #define TAG "BLE_MIDI"
@@ -211,7 +213,6 @@ static void play_sound(int16_t* buffer, size_t samples) {
 
 // Update the process_midi_message function to include sound generation
 static void process_midi_message(uint8_t status, uint8_t* data, size_t len, uint32_t timestamp) {
-    // Log received message
     ESP_LOGI(TAG, "MIDI message received - Status: 0x%02X, Len: %d, Timestamp: %lu", 
              status, len, timestamp);
     
@@ -220,38 +221,26 @@ static void process_midi_message(uint8_t status, uint8_t* data, size_t len, uint
         uint8_t note = data[0];
         uint8_t velocity = data[1];
         
-        ESP_LOGI(TAG, "Note On - Note: %d, Velocity: %d", note, velocity);
-        
         if (velocity > 0) {
-            switch(note) {
-                case MIDI_NOTE_KICK:
-                    generate_kick(audio_buffer, SAMPLES_PER_BUFFER);
-                    play_sound(audio_buffer, SAMPLES_PER_BUFFER);
-                    snprintf(latest_midi_msg, sizeof(latest_midi_msg), 
-                        "Kick Drum - Note: %d, Velocity: %d", note, velocity);
-                    break;
+            // Find matching sample
+            for (int i = 0; i < NUM_SAMPLES; i++) {
+                if (SAMPLE_MAPPINGS[i].midi_note == note) {
+                    // Calculate volume based on velocity
+                    float volume = SAMPLE_MAPPINGS[i].volume * (velocity / 127.0f);
                     
-                case MIDI_NOTE_SNARE:
-                    generate_snare(audio_buffer, SAMPLES_PER_BUFFER);
-                    play_sound(audio_buffer, SAMPLES_PER_BUFFER);
-                    snprintf(latest_midi_msg, sizeof(latest_midi_msg), 
-                        "Snare Drum - Note: %d, Velocity: %d", note, velocity);
-                    break;
+                    // Play the WAV file
+                    esp_err_t ret = wav_player_play(SAMPLE_MAPPINGS[i].wav_file, volume);
+                    if (ret != ESP_OK) {
+                        ESP_LOGE(TAG, "Failed to play WAV file: %s", SAMPLE_MAPPINGS[i].wav_file);
+                    }
                     
-                case MIDI_NOTE_HIHAT:
-                    generate_hihat(audio_buffer, SAMPLES_PER_BUFFER);
-                    play_sound(audio_buffer, SAMPLES_PER_BUFFER);
                     snprintf(latest_midi_msg, sizeof(latest_midi_msg), 
-                        "Hi-Hat - Note: %d, Velocity: %d", note, velocity);
+                        "Playing %s - Note: %d, Velocity: %d", 
+                        SAMPLE_MAPPINGS[i].wav_file, note, velocity);
+                    new_message = true;
                     break;
-                    
-                default:
-                    snprintf(latest_midi_msg, sizeof(latest_midi_msg), 
-                        "Note On - Note: %d, Velocity: %d", note, velocity);
-                    break;
+                }
             }
-            new_message = true;
-            ESP_LOGI(TAG, "Latest MIDI message: %s", latest_midi_msg);
         }
     }
 }
@@ -836,4 +825,11 @@ void app_main(void) {
 
     // Initialize MIDI state
     init_midi_state(&midi_state);
+
+    // Initialize WAV player (using wav_ret instead of ret)
+    esp_err_t wav_ret = wav_player_init(tx_handle);
+    if (wav_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize WAV player");
+        return;
+    }
 }
